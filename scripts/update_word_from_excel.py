@@ -24,9 +24,10 @@ DEFAULT_ROLE_COL_INDEX = 2  # third column (C)
 DEFAULT_TARGET_TEXT = "Когогину С.А."
 DEFAULT_COMPANY_TARGET_TEXT = "ПАО «Камаз»"
 DEFAULT_ROLE_TARGET_TEXT = "Генеральному директору"
+DEFAULT_EMAIL_TARGET_TEXT = "info@truckinstock.com"
 DEFAULT_SALUTATION_ANCHOR = "Уважаемый "
 DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
-EMAIL_REGEX = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 MORPH = pymorphy3.MorphAnalyzer()
 
 
@@ -151,6 +152,16 @@ def load_sheet_dataframe(excel_path: str, sheet_index: int) -> pd.DataFrame:
         )
     sheet_name = xls.sheet_names[sheet_index]
     return pd.read_excel(excel_path, sheet_name=sheet_name)
+
+
+def extract_first_email(text: str) -> str:
+    """
+    Extract first email found anywhere in text.
+    """
+    match = EMAIL_REGEX.search(str(text))
+    if not match:
+        raise ValueError("No email found in text")
+    return match.group(0)
 
 
 def format_replacement_name(raw_value: str) -> str:
@@ -845,6 +856,8 @@ def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
     company_replacement = str(df.iat[row_idx, DEFAULT_COMPANY_COL_INDEX])
     role_raw = str(df.iat[row_idx, DEFAULT_ROLE_COL_INDEX])
     role_replacement = format_role_to_dative(role_raw)
+    last_col_idx = df.shape[1] - 1
+    email_replacement = extract_first_email(str(df.iat[row_idx, last_col_idx]))
     salutation_name = format_salutation_name(replacement_raw)
     salutation_replacement = f"Уважаемый {salutation_name}!"
 
@@ -852,6 +865,7 @@ def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
         (DEFAULT_TARGET_TEXT, replacement),
         (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
         (DEFAULT_ROLE_TARGET_TEXT, role_replacement),
+        (DEFAULT_EMAIL_TARGET_TEXT, email_replacement),
         {
             "mode": "salutation_place",
             "replacement": salutation_replacement,
