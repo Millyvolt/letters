@@ -24,6 +24,7 @@ DEFAULT_ROLE_COL_INDEX = 2  # third column (C)
 DEFAULT_TARGET_TEXT = "Когогину С.А."
 DEFAULT_COMPANY_TARGET_TEXT = "ПАО «Камаз»"
 DEFAULT_ROLE_TARGET_TEXT = "Генеральному директору"
+DEFAULT_SALUTATION_ANCHOR = "Уважаемый "
 DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
 MORPH = pymorphy3.MorphAnalyzer()
 
@@ -169,27 +170,68 @@ def _preserve_word_case(source: str, transformed: str) -> str:
     return transformed
 
 
-def _inflect_word_to_dative(word: str) -> str:
+def _inflect_word_to_case(word: str, target_case: str, prefer_name: bool = False) -> str:
     """
-    Inflect a single Russian word to dative when possible.
+    Inflect a single Russian word to the target case, preserving source casing.
     """
     parses = MORPH.parse(word)
     if not parses:
         return word
 
     preferred = None
-    for p in parses:
-        tag_str = str(p.tag)
-        if "sing" in tag_str and ("NOUN" in tag_str or "ADJF" in tag_str or "PRTF" in tag_str):
-            preferred = p
-            break
+    if prefer_name:
+        for p in parses:
+            tag_str = str(p.tag)
+            if "Name" in tag_str and "sing" in tag_str:
+                preferred = p
+                break
+        if preferred is None:
+            for p in parses:
+                tag_str = str(p.tag)
+                if "Patr" in tag_str and "sing" in tag_str:
+                    preferred = p
+                    break
+
+    if preferred is None:
+        for p in parses:
+            tag_str = str(p.tag)
+            if "sing" in tag_str and ("NOUN" in tag_str or "ADJF" in tag_str or "PRTF" in tag_str):
+                preferred = p
+                break
     if preferred is None:
         preferred = parses[0]
 
-    inflected = preferred.inflect({DEFAULT_TARGET_CASE})
+    inflected = preferred.inflect({target_case})
     if inflected is None:
         return word
     return _preserve_word_case(word, inflected.word)
+
+
+def _inflect_word_to_dative(word: str) -> str:
+    """
+    Inflect a single Russian word to dative when possible.
+    """
+    return _inflect_word_to_case(word, DEFAULT_TARGET_CASE)
+
+
+def format_salutation_name(raw_value: str) -> str:
+    """
+    Build salutation name fragment:
+    - if 2 words: take only first word (name), no case inflection;
+    - if 3+ words: take first + second words, no case inflection.
+    """
+    words = [w for w in str(raw_value).split() if w]
+    if not words:
+        raise ValueError("Name cell is empty for salutation")
+
+    if len(words) == 1:
+        selected = [words[0]]
+    elif len(words) == 2:
+        selected = [words[0]]
+    else:
+        selected = [words[0], words[1]]
+
+    return " ".join(selected)
 
 
 def format_role_to_dative(raw_value: str) -> str:
@@ -588,8 +630,56 @@ def replace_texts_with_word_com(
     word.DisplayAlerts = 0
     doc = None
 
+    def replace_salutation_by_place(text_range, replacement: str) -> None:
+        """
+        Find first salutation anchor and replace up to '!' in the same paragraph.
+        """
+        finder = text_range.Find
+        finder.ClearFormatting()
+        finder.Replacement.ClearFormatting()
+        found = finder.Execute(
+            FindText=DEFAULT_SALUTATION_ANCHOR,
+            MatchCase=False,
+            MatchWholeWord=False,
+            MatchWildcards=False,
+            MatchSoundsLike=False,
+            MatchAllWordForms=False,
+            Forward=True,
+            Wrap=1,  # wdFindContinue
+            Format=False,
+        )
+        if not found:
+            return
+
+        start_pos = text_range.Start
+        para_end = text_range.Paragraphs(1).Range.End
+        para_range = doc.Range(start_pos, para_end)
+        para_text = para_range.Text
+
+        excl_idx = para_text.find("!")
+        if excl_idx == -1:
+            return
+
+        end_pos = start_pos + excl_idx + 1
+        replace_range = doc.Range(start_pos, end_pos)
+        replace_range.Text = replacement
+
     def replace_in_range(text_range) -> None:
-        for target, replacement in replacements:
+        for item in replacements:
+            if isinstance(item, tuple):
+                target, replacement = item
+                match_wildcards = False
+                replace_mode = 2  # wdReplaceAll
+            else:
+                mode = item.get("mode")
+                if mode == "salutation_place":
+                    replace_salutation_by_place(text_range, item["replacement"])
+                    continue
+                target = item["target"]
+                replacement = item["replacement"]
+                match_wildcards = bool(item.get("wildcards", False))
+                replace_mode = int(item.get("replace_mode", 2))
+
             finder = text_range.Find
             finder.ClearFormatting()
             finder.Replacement.ClearFormatting()
@@ -597,14 +687,14 @@ def replace_texts_with_word_com(
                 FindText=target,
                 MatchCase=False,
                 MatchWholeWord=False,
-                MatchWildcards=False,
+                MatchWildcards=match_wildcards,
                 MatchSoundsLike=False,
                 MatchAllWordForms=False,
                 Forward=True,
                 Wrap=1,  # wdFindContinue
                 Format=False,
                 ReplaceWith=replacement,
-                Replace=2,  # wdReplaceAll
+                Replace=replace_mode,
             )
 
     try:
@@ -769,6 +859,8 @@ def main() -> None:
         row_number=args.rowNumber,
     )
     role_replacement = format_role_to_dative(role_raw)
+    salutation_name = format_salutation_name(replacement_raw)
+    salutation_replacement = f"Уважаемый {salutation_name}!"
 
     word_dir, word_name = os.path.split(default_word)
     base, ext = os.path.splitext(word_name)
@@ -783,12 +875,17 @@ def main() -> None:
             (DEFAULT_TARGET_TEXT, replacement),
             (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
             (DEFAULT_ROLE_TARGET_TEXT, role_replacement),
+            {
+                "mode": "salutation_place",
+                "replacement": salutation_replacement,
+            },
         ],
     )
 
     print("Excel value:", replacement)
     print("Company value:", company_replacement)
     print("Role value:", role_replacement)
+    print("Salutation value:", salutation_replacement)
     print("Engine used: word-com")
     print("Updated Word file written to:", output_path)
 
