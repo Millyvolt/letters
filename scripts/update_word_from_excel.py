@@ -18,8 +18,10 @@ from docx.text.paragraph import Paragraph
 from xml.etree import ElementTree as ET
 
 DEFAULT_SHEET_INDEX = 1  # second sheet
-DEFAULT_COL_INDEX = 1  # second column (B)
+DEFAULT_NAME_COL_INDEX = 1  # second column (B)
+DEFAULT_COMPANY_COL_INDEX = 0  # first column (A)
 DEFAULT_TARGET_TEXT = "Когогину С.А."
+DEFAULT_COMPANY_TARGET_TEXT = "ПАО «Камаз»"
 DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
 MORPH = pymorphy3.MorphAnalyzer()
 
@@ -449,6 +451,68 @@ def replace_text_with_word_com(
         pythoncom.CoUninitialize()
 
 
+def replace_texts_with_word_com(
+    docx_path: str,
+    output_path: str,
+    replacements: list[tuple[str, str]],
+) -> None:
+    """
+    Use Microsoft Word automation to apply multiple replacements and save once.
+    """
+    pythoncom.CoInitialize()
+    word = win32com.client.DispatchEx("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = 0
+    doc = None
+
+    def replace_in_range(text_range) -> None:
+        for target, replacement in replacements:
+            finder = text_range.Find
+            finder.ClearFormatting()
+            finder.Replacement.ClearFormatting()
+            finder.Execute(
+                FindText=target,
+                MatchCase=False,
+                MatchWholeWord=False,
+                MatchWildcards=False,
+                MatchSoundsLike=False,
+                MatchAllWordForms=False,
+                Forward=True,
+                Wrap=1,  # wdFindContinue
+                Format=False,
+                ReplaceWith=replacement,
+                Replace=2,  # wdReplaceAll
+            )
+
+    try:
+        doc = word.Documents.Open(docx_path, ReadOnly=False, AddToRecentFiles=False)
+        replace_in_range(doc.Content)
+
+        story = doc.StoryRanges
+        if story is not None:
+            current = story.Item(1)
+            while current is not None:
+                replace_in_range(current)
+                current = current.NextStoryRange
+
+        for shp in doc.Shapes:
+            if shp.TextFrame.HasText:
+                replace_in_range(shp.TextFrame.TextRange)
+        for shp in doc.InlineShapes:
+            try:
+                if shp.TextFrame.HasText:
+                    replace_in_range(shp.TextFrame.TextRange)
+            except Exception:
+                pass
+
+        doc.SaveAs2(output_path, FileFormat=12)
+    finally:
+        if doc is not None:
+            doc.Close(False)
+        word.Quit()
+        pythoncom.CoUninitialize()
+
+
 def replace_span_in_docx(
     docx_path: str,
     start_index: int,
@@ -559,10 +623,16 @@ def main() -> None:
     replacement_raw = read_excel_value(
         excel_path=default_excel,
         sheet_index=DEFAULT_SHEET_INDEX,
-        col_index=DEFAULT_COL_INDEX,
+        col_index=DEFAULT_NAME_COL_INDEX,
         row_number=args.rowNumber,
     )
     replacement = format_replacement_name(replacement_raw)
+    company_replacement = read_excel_value(
+        excel_path=default_excel,
+        sheet_index=DEFAULT_SHEET_INDEX,
+        col_index=DEFAULT_COMPANY_COL_INDEX,
+        row_number=args.rowNumber,
+    )
 
     word_dir, word_name = os.path.split(default_word)
     base, ext = os.path.splitext(word_name)
@@ -570,23 +640,18 @@ def main() -> None:
     output_name = f"{base}.updated.row{args.rowNumber}.{timestamp}{ext}"
     output_path = os.path.join(word_dir, output_name)
 
-    try:
-        replace_text_with_word_com(
-            docx_path=default_word,
-            output_path=output_path,
-            target=DEFAULT_TARGET_TEXT,
-            replacement=replacement,
-        )
-    except Exception:
-        # Fallback path if Word COM is unavailable.
-        replace_text_in_docx(
-            docx_path=default_word,
-            target=DEFAULT_TARGET_TEXT,
-            replacement=replacement,
-            output_path=output_path,
-        )
+    replace_texts_with_word_com(
+        docx_path=default_word,
+        output_path=output_path,
+        replacements=[
+            (DEFAULT_TARGET_TEXT, replacement),
+            (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
+        ],
+    )
 
     print("Excel value:", replacement)
+    print("Company value:", company_replacement)
+    print("Engine used: word-com")
     print("Updated Word file written to:", output_path)
 
 
