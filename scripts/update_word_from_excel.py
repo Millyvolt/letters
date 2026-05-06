@@ -33,7 +33,7 @@ MORPH = pymorphy3.MorphAnalyzer()
 
 def inflect_to_genitive(word: str) -> str:
     """
-    Convert a Russian word to genitive case when possible.
+    Convert surname to recipient form (dative) when possible.
     Keeps punctuation around the word unchanged.
     """
     match = re.match(r"^([^A-Za-zА-Яа-яЁё]*)([A-Za-zА-Яа-яЁё-]+)([^A-Za-zА-Яа-яЁё]*)$", word)
@@ -45,9 +45,22 @@ def inflect_to_genitive(word: str) -> str:
     if not parses:
         return word
 
-    # Prefer surname-like singular parses to avoid incorrect plural forms.
+    # Prefer surname-like singular parses for correct family-name inflection.
     preferred = None
+    core_lower = core.lower()
+    prefer_female_surname = core_lower.endswith(
+        ("ова", "ева", "ёва", "ина", "ына", "ая", "яя")
+    )
+
+    if prefer_female_surname:
+        for p in parses:
+            tag_str = str(p.tag)
+            if "Surn" in tag_str and "sing" in tag_str and "femn" in tag_str:
+                preferred = p
+                break
     for p in parses:
+        if preferred is not None:
+            break
         tag_str = str(p.tag)
         if "Surn" in tag_str and "sing" in tag_str:
             preferred = p
@@ -61,20 +74,34 @@ def inflect_to_genitive(word: str) -> str:
     if preferred is None:
         preferred = parses[0]
 
-    inflected = preferred.inflect({DEFAULT_TARGET_CASE})
+    inflected = preferred.inflect({"datv"})
     inflected_core = inflected.word if inflected else core
 
-    # Fallback heuristic for common masculine surnames where analyzer can
-    # mistakenly return plural dative (e.g. "Ширманам" instead of "Ширманову").
-    core_lower = core.lower()
-    if DEFAULT_TARGET_CASE == "datv":
-        if inflected_core.endswith("ам") and (
-            core_lower.endswith("ов")
-            or core_lower.endswith("ев")
-            or core_lower.endswith("ин")
-            or core_lower.endswith("ын")
-        ):
+    # Fallback heuristic for surnames if parser returns plural-looking output.
+    if inflected_core.endswith("ам") and (
+        core_lower.endswith("ов")
+        or core_lower.endswith("ев")
+        or core_lower.endswith("ин")
+        or core_lower.endswith("ын")
+    ):
+        inflected_core = f"{core_lower}у"
+
+    # Fallback for common surname endings when inflection is unchanged.
+    if inflected_core.lower() == core_lower:
+        if core_lower.endswith("ов") or core_lower.endswith("ев") or core_lower.endswith("ёв"):
             inflected_core = f"{core_lower}у"
+        elif core_lower.endswith("ин") or core_lower.endswith("ын"):
+            inflected_core = f"{core_lower}у"
+        elif core_lower.endswith("ова"):
+            inflected_core = f"{core_lower[:-1]}ой"
+        elif core_lower.endswith("ева"):
+            inflected_core = f"{core_lower[:-1]}ой"
+        elif core_lower.endswith("ёва"):
+            inflected_core = f"{core_lower[:-1]}ой"
+        elif core_lower.endswith("ина") or core_lower.endswith("ына"):
+            inflected_core = f"{core_lower[:-1]}ой"
+        elif core_lower.endswith("ая"):
+            inflected_core = f"{core_lower[:-2]}ой"
 
     # pymorphy обычно возвращает в нижнем регистре; сохраняем стиль исходного слова.
     if core.isupper():
@@ -168,7 +195,7 @@ def format_replacement_name(raw_value: str) -> str:
     """
     Transform source text:
     - take at most first 3 words.
-    - if 3 words: first two -> initials ("X."), third stays full.
+    - if 3 words: first two -> initials ("X.Y."), third stays full.
     - if 2 words: first -> initial ("X."), second stays full.
     - if 1 word: keep it full.
     - final output word is converted to genitive case.
@@ -180,15 +207,88 @@ def format_replacement_name(raw_value: str) -> str:
 
     result_parts = []
     if len(words) >= 3:
-        result_parts = [f"{words[0][0]}.", f"{words[1][0]}.", words[2]]
+        surname_gen = inflect_to_genitive(words[2])
+        return f"{words[0][0]}.{words[1][0]}.{surname_gen}"
     elif len(words) == 2:
-        result_parts = [f"{words[0][0]}.", words[1]]
+        surname_gen = inflect_to_genitive(words[1])
+        return f"{words[0][0]}.{surname_gen}"
     else:
         result_parts = [words[0]]
 
     result_parts[-1] = inflect_to_genitive(result_parts[-1])
 
     return " ".join(result_parts)
+
+
+def normalize_fio_order(raw_value: str) -> str:
+    """
+    Normalize 3-word full name to order: FirstName Patronymic LastName.
+    If confidence is low, keep original order.
+    """
+    words = [w for w in str(raw_value).split() if w]
+    if len(words) != 3:
+        return str(raw_value).strip()
+
+    def is_patronymic(word: str) -> bool:
+        wl = word.lower().strip(".,;:!?()[]{}\"'")
+        return (
+            wl.endswith("вич")
+            or wl.endswith("ич")
+            or wl.endswith("вна")
+            or wl.endswith("ична")
+            or wl.endswith("инична")
+        )
+
+    def name_score(word: str) -> int:
+        score = 0
+        parses = MORPH.parse(word)
+        for p in parses[:5]:
+            tag = str(p.tag)
+            if "Name" in tag:
+                score += 3
+            if "Surn" in tag:
+                score -= 2
+        return score
+
+    def surname_score(word: str) -> int:
+        score = 0
+        parses = MORPH.parse(word)
+        for p in parses[:5]:
+            tag = str(p.tag)
+            if "Surn" in tag:
+                score += 3
+            if "Name" in tag:
+                score -= 1
+        wl = word.lower().strip(".,;:!?()[]{}\"'")
+        if wl.endswith(("ов", "ев", "ёв", "ин", "ын", "ская", "ская", "ская", "енко", "ук", "юк")):
+            score += 1
+        return score
+
+    # 1) Locate patronymic confidently.
+    patronymic_idx = None
+    for i, w in enumerate(words):
+        if is_patronymic(w):
+            patronymic_idx = i
+            break
+    if patronymic_idx is None:
+        # no strong signal -> keep original
+        return " ".join(words)
+
+    remaining = [i for i in range(3) if i != patronymic_idx]
+    i1, i2 = remaining[0], remaining[1]
+
+    # 2) Decide which remaining token is first name vs surname.
+    first_candidate = i1
+    last_candidate = i2
+    n1, n2 = name_score(words[i1]), name_score(words[i2])
+    s1, s2 = surname_score(words[i1]), surname_score(words[i2])
+
+    # Prefer strongest evidence.
+    if (n2 - s2) > (n1 - s1):
+        first_candidate, last_candidate = i2, i1
+
+    ordered = [words[first_candidate], words[patronymic_idx], words[last_candidate]]
+    return " ".join(ordered)
 
 
 def _preserve_word_case(source: str, transformed: str) -> str:
@@ -895,7 +995,7 @@ def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
     """
     Build all replacement values for one dataframe row.
     """
-    replacement_raw = str(df.iat[row_idx, DEFAULT_NAME_COL_INDEX])
+    replacement_raw = normalize_fio_order(str(df.iat[row_idx, DEFAULT_NAME_COL_INDEX]))
     replacement = format_replacement_name(replacement_raw)
     company_replacement = str(df.iat[row_idx, DEFAULT_COMPANY_COL_INDEX])
     role_raw = str(df.iat[row_idx, DEFAULT_ROLE_COL_INDEX])
