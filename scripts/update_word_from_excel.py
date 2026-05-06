@@ -263,6 +263,50 @@ def format_salutation_name(raw_value: str) -> str:
     return " ".join(selected)
 
 
+def detect_gender_from_name(raw_value: str) -> str | None:
+    """
+    Detect person gender from full name text.
+    Returns:
+    - "femn" for female
+    - "masc" for male
+    - None if unknown
+    """
+    words = [w.strip(".,;:!?()[]{}\"'") for w in str(raw_value).split() if w]
+    if not words:
+        return None
+
+    # 1) Patronymic heuristic is the most reliable in Russian names.
+    for w in words:
+        wl = w.lower()
+        if wl.endswith("вна") or wl.endswith("ична") or wl.endswith("инична"):
+            return "femn"
+        if wl.endswith("ич"):
+            return "masc"
+
+    # 2) Morphology fallback: try to detect from likely name words.
+    for w in words[:3]:
+        parses = MORPH.parse(w)
+        for p in parses:
+            tag_str = str(p.tag)
+            if "Name" in tag_str:
+                if "femn" in tag_str:
+                    return "femn"
+                if "masc" in tag_str:
+                    return "masc"
+
+    return None
+
+
+def get_salutation_prefix(raw_value: str) -> str:
+    """
+    Return gender-aware salutation prefix.
+    """
+    gender = detect_gender_from_name(raw_value)
+    if gender == "femn":
+        return "Уважаемая"
+    return "Уважаемый"
+
+
 def format_role_to_dative(raw_value: str) -> str:
     """
     Convert role/title text to dative in a conservative way:
@@ -859,7 +903,8 @@ def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
     last_col_idx = df.shape[1] - 1
     email_replacement = extract_first_email(str(df.iat[row_idx, last_col_idx]))
     salutation_name = format_salutation_name(replacement_raw)
-    salutation_replacement = f"Уважаемый {salutation_name}!"
+    salutation_prefix = get_salutation_prefix(replacement_raw)
+    salutation_replacement = f"{salutation_prefix} {salutation_name}!"
 
     return [
         (DEFAULT_TARGET_TEXT, replacement),
