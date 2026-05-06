@@ -20,8 +20,10 @@ from xml.etree import ElementTree as ET
 DEFAULT_SHEET_INDEX = 1  # second sheet
 DEFAULT_NAME_COL_INDEX = 1  # second column (B)
 DEFAULT_COMPANY_COL_INDEX = 0  # first column (A)
+DEFAULT_ROLE_COL_INDEX = 2  # third column (C)
 DEFAULT_TARGET_TEXT = "Когогину С.А."
 DEFAULT_COMPANY_TARGET_TEXT = "ПАО «Камаз»"
+DEFAULT_ROLE_TARGET_TEXT = "Генеральному директору"
 DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
 MORPH = pymorphy3.MorphAnalyzer()
 
@@ -157,6 +159,121 @@ def format_replacement_name(raw_value: str) -> str:
     result_parts[-1] = inflect_to_genitive(result_parts[-1])
 
     return " ".join(result_parts)
+
+
+def _preserve_word_case(source: str, transformed: str) -> str:
+    if source.isupper():
+        return transformed.upper()
+    if source[:1].isupper():
+        return transformed[:1].upper() + transformed[1:]
+    return transformed
+
+
+def _inflect_word_to_dative(word: str) -> str:
+    """
+    Inflect a single Russian word to dative when possible.
+    """
+    parses = MORPH.parse(word)
+    if not parses:
+        return word
+
+    preferred = None
+    for p in parses:
+        tag_str = str(p.tag)
+        if "sing" in tag_str and ("NOUN" in tag_str or "ADJF" in tag_str or "PRTF" in tag_str):
+            preferred = p
+            break
+    if preferred is None:
+        preferred = parses[0]
+
+    inflected = preferred.inflect({DEFAULT_TARGET_CASE})
+    if inflected is None:
+        return word
+    return _preserve_word_case(word, inflected.word)
+
+
+def format_role_to_dative(raw_value: str) -> str:
+    """
+    Convert role/title text to dative in a conservative way:
+    - work by slash-separated segments;
+    - skip segments that start with "И.о.";
+    - in each segment, inflect only the leading nominative phrase:
+      stop at first preposition or first non-nominative/accusative word.
+    This matches cases like:
+    - "Начальник отдела ..." -> "Начальнику отдела ..."
+    - "первый проректор по ..." -> "первому проректору по ..."
+    """
+    text = str(raw_value).strip()
+    if not text:
+        raise ValueError("Role cell is empty")
+
+    segments = re.split(r"(\s*/\s*)", text)
+    result_segments = []
+
+    for seg in segments:
+        if "/" in seg:
+            result_segments.append(seg)
+            continue
+
+        if re.match(r"^\s*и\.о\.", seg, flags=re.IGNORECASE):
+            result_segments.append(seg)
+            continue
+
+        tokens = re.split(r"(\s+)", seg)
+        out_tokens = []
+        started = False
+        done = False
+
+        for tok in tokens:
+            if not tok or tok.isspace():
+                out_tokens.append(tok)
+                continue
+
+            m = re.match(r"^([^A-Za-zА-Яа-яЁё-]*)([A-Za-zА-Яа-яЁё-]+)([^A-Za-zА-Яа-яЁё-]*)$", tok)
+            if not m:
+                out_tokens.append(tok)
+                continue
+
+            prefix, core, suffix = m.groups()
+            parses = MORPH.parse(core)
+            if not parses:
+                out_tokens.append(tok)
+                continue
+
+            p = parses[0]
+            tag = p.tag
+            pos = tag.POS
+
+            if done:
+                out_tokens.append(tok)
+                continue
+
+            # Stop inflection on prepositions.
+            if pos == "PREP":
+                done = True
+                out_tokens.append(tok)
+                continue
+
+            # Start only on adjective/noun-like words.
+            if not started:
+                if pos not in ("NOUN", "ADJF", "PRTF", "NPRO"):
+                    out_tokens.append(tok)
+                    continue
+                started = True
+
+            case = tag.case
+            # Only keep inflecting while words look like nominative/accusative.
+            if case not in ("nomn", "accs", None):
+                done = True
+                out_tokens.append(tok)
+                continue
+
+            out_core = _inflect_word_to_dative(core)
+            out_tokens.append(f"{prefix}{out_core}{suffix}")
+
+        result_segments.append("".join(out_tokens))
+
+    return "".join(result_segments)
 
 
 def _iter_paragraphs_from_table(table: Table) -> Iterable[Paragraph]:
@@ -417,7 +534,13 @@ def replace_text_with_word_com(
         )
 
     try:
-        doc = word.Documents.Open(docx_path, ReadOnly=False, AddToRecentFiles=False)
+        doc = word.Documents.Open(
+            FileName=docx_path,
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            OpenAndRepair=True,
+        )
 
         # Main story
         replace_in_range(doc.Content)
@@ -485,7 +608,13 @@ def replace_texts_with_word_com(
             )
 
     try:
-        doc = word.Documents.Open(docx_path, ReadOnly=False, AddToRecentFiles=False)
+        doc = word.Documents.Open(
+            FileName=docx_path,
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            OpenAndRepair=True,
+        )
         replace_in_range(doc.Content)
 
         story = doc.StoryRanges
@@ -633,6 +762,13 @@ def main() -> None:
         col_index=DEFAULT_COMPANY_COL_INDEX,
         row_number=args.rowNumber,
     )
+    role_raw = read_excel_value(
+        excel_path=default_excel,
+        sheet_index=DEFAULT_SHEET_INDEX,
+        col_index=DEFAULT_ROLE_COL_INDEX,
+        row_number=args.rowNumber,
+    )
+    role_replacement = format_role_to_dative(role_raw)
 
     word_dir, word_name = os.path.split(default_word)
     base, ext = os.path.splitext(word_name)
@@ -646,11 +782,13 @@ def main() -> None:
         replacements=[
             (DEFAULT_TARGET_TEXT, replacement),
             (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
+            (DEFAULT_ROLE_TARGET_TEXT, role_replacement),
         ],
     )
 
     print("Excel value:", replacement)
     print("Company value:", company_replacement)
+    print("Role value:", role_replacement)
     print("Engine used: word-com")
     print("Updated Word file written to:", output_path)
 
