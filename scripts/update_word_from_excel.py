@@ -11,6 +11,7 @@ import pandas as pd
 import pymorphy3
 import pythoncom
 import win32com.client
+from openpyxl import load_workbook
 from docx import Document
 from docx.document import Document as _Document
 from docx.table import _Cell, Table
@@ -179,6 +180,50 @@ def load_sheet_dataframe(excel_path: str, sheet_index: int) -> pd.DataFrame:
         )
     sheet_name = xls.sheet_names[sheet_index]
     return pd.read_excel(excel_path, sheet_name=sheet_name)
+
+
+def load_sheet_for_styles(excel_path: str, sheet_index: int):
+    """
+    Load Excel worksheet with style information.
+    """
+    wb = load_workbook(excel_path, data_only=True)
+    ws = wb.worksheets[sheet_index]
+    return wb, ws
+
+
+def is_cell_yellow(cell) -> bool:
+    """
+    Detect yellow fill in an openpyxl cell.
+    """
+    fill = cell.fill
+    if fill is None:
+        return False
+    if fill.fill_type in (None, "none"):
+        return False
+    color = fill.fgColor
+    if color is None:
+        return False
+
+    # RGB/ARGB yellow variants
+    if color.type == "rgb" and color.rgb:
+        rgb = color.rgb.upper()
+        return rgb in ("FFFF00", "FFFFFF00")
+
+    # Indexed palette yellow is commonly index 6
+    if color.type == "indexed" and color.indexed is not None:
+        return int(color.indexed) == 6
+
+    return False
+
+
+def is_row_yellow(ws, excel_row_number: int) -> bool:
+    """
+    True if any cell in the Excel row has yellow fill.
+    """
+    for cell in ws[excel_row_number]:
+        if is_cell_yellow(cell):
+            return True
+    return False
 
 
 def extract_first_email(text: str) -> str:
@@ -1018,7 +1063,7 @@ def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
     ]
 
 
-def validate_row_for_batch(df: pd.DataFrame, row_idx: int) -> list[str]:
+def validate_row_for_batch(df: pd.DataFrame, row_idx: int, ws=None) -> list[str]:
     """
     Validate row for batch processing.
     Rules:
@@ -1035,6 +1080,11 @@ def validate_row_for_batch(df: pd.DataFrame, row_idx: int) -> list[str]:
     email_value = str(df.iat[row_idx, last_col_idx]).strip()
     if not EMAIL_REGEX.search(email_value):
         reasons.append("Last column must contain a valid email")
+
+    if ws is not None:
+        excel_row_number = row_idx + 2
+        if is_row_yellow(ws, excel_row_number):
+            reasons.append("Row has yellow fill")
 
     return reasons
 
@@ -1100,24 +1150,28 @@ def main() -> None:
     df = load_sheet_dataframe(default_excel, DEFAULT_SHEET_INDEX)
 
     if args.allRows:
+        wb, ws = load_sheet_for_styles(default_excel, DEFAULT_SHEET_INDEX)
         processed_files = []
         skipped_rows = []
-        for row_idx in range(len(df)):
-            reasons = validate_row_for_batch(df, row_idx)
-            if reasons:
-                row_data = df.iloc[row_idx].to_dict()
-                row_data["ExcelRow"] = row_idx + 2
-                row_data["Reason"] = "; ".join(reasons)
-                skipped_rows.append(row_data)
-                continue
+        try:
+            for row_idx in range(len(df)):
+                reasons = validate_row_for_batch(df, row_idx, ws=ws)
+                if reasons:
+                    row_data = df.iloc[row_idx].to_dict()
+                    row_data["ExcelRow"] = row_idx + 2
+                    row_data["Reason"] = "; ".join(reasons)
+                    skipped_rows.append(row_data)
+                    continue
 
-            out_file = process_single_row(
-                df=df,
-                row_idx=row_idx,
-                default_word=default_word,
-                output_folder=output_folder,
-            )
-            processed_files.append(out_file)
+                out_file = process_single_row(
+                    df=df,
+                    row_idx=row_idx,
+                    default_word=default_word,
+                    output_folder=output_folder,
+                )
+                processed_files.append(out_file)
+        finally:
+            wb.close()
 
         skipped_report_path = os.path.join(output_folder, "skipped_rows.xlsx")
         skipped_df = pd.DataFrame(skipped_rows)
