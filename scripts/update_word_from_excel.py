@@ -1,12 +1,14 @@
 import argparse
 import io
 import os
+import re
 import zipfile
 from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 from typing import Iterable
 
 import pandas as pd
+import pymorphy3
 import pythoncom
 import win32com.client
 from docx import Document
@@ -14,6 +16,66 @@ from docx.document import Document as _Document
 from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from xml.etree import ElementTree as ET
+
+DEFAULT_SHEET_INDEX = 1  # second sheet
+DEFAULT_COL_INDEX = 1  # second column (B)
+DEFAULT_TARGET_TEXT = "Когогину С.А."
+DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
+MORPH = pymorphy3.MorphAnalyzer()
+
+
+def inflect_to_genitive(word: str) -> str:
+    """
+    Convert a Russian word to genitive case when possible.
+    Keeps punctuation around the word unchanged.
+    """
+    match = re.match(r"^([^A-Za-zА-Яа-яЁё]*)([A-Za-zА-Яа-яЁё-]+)([^A-Za-zА-Яа-яЁё]*)$", word)
+    if not match:
+        return word
+
+    prefix, core, suffix = match.groups()
+    parses = MORPH.parse(core)
+    if not parses:
+        return word
+
+    # Prefer surname-like singular parses to avoid incorrect plural forms.
+    preferred = None
+    for p in parses:
+        tag_str = str(p.tag)
+        if "Surn" in tag_str and "sing" in tag_str:
+            preferred = p
+            break
+    if preferred is None:
+        for p in parses:
+            tag_str = str(p.tag)
+            if "sing" in tag_str and ("NOUN" in tag_str or "NPRO" in tag_str):
+                preferred = p
+                break
+    if preferred is None:
+        preferred = parses[0]
+
+    inflected = preferred.inflect({DEFAULT_TARGET_CASE})
+    inflected_core = inflected.word if inflected else core
+
+    # Fallback heuristic for common masculine surnames where analyzer can
+    # mistakenly return plural dative (e.g. "Ширманам" instead of "Ширманову").
+    core_lower = core.lower()
+    if DEFAULT_TARGET_CASE == "datv":
+        if inflected_core.endswith("ам") and (
+            core_lower.endswith("ов")
+            or core_lower.endswith("ев")
+            or core_lower.endswith("ин")
+            or core_lower.endswith("ын")
+        ):
+            inflected_core = f"{core_lower}у"
+
+    # pymorphy обычно возвращает в нижнем регистре; сохраняем стиль исходного слова.
+    if core.isupper():
+        inflected_core = inflected_core.upper()
+    elif core[:1].isupper():
+        inflected_core = inflected_core[:1].upper() + inflected_core[1:]
+
+    return f"{prefix}{inflected_core}{suffix}"
 
 
 def read_excel_value(
@@ -66,6 +128,33 @@ def read_excel_value(
         )
 
     return str(value)
+
+
+def format_replacement_name(raw_value: str) -> str:
+    """
+    Transform source text:
+    - take at most first 3 words.
+    - if 3 words: first two -> initials ("X."), third stays full.
+    - if 2 words: first -> initial ("X."), second stays full.
+    - if 1 word: keep it full.
+    - final output word is converted to genitive case.
+    """
+    words = [w for w in str(raw_value).split() if w]
+    words = words[:3]
+    if not words:
+        raise ValueError("Source cell has no words to format")
+
+    result_parts = []
+    if len(words) >= 3:
+        result_parts = [f"{words[0][0]}.", f"{words[1][0]}.", words[2]]
+    elif len(words) == 2:
+        result_parts = [f"{words[0][0]}.", words[1]]
+    else:
+        result_parts = [words[0]]
+
+    result_parts[-1] = inflect_to_genitive(result_parts[-1])
+
+    return " ".join(result_parts)
 
 
 def _iter_paragraphs_from_table(table: Table) -> Iterable[Paragraph]:
@@ -447,81 +536,17 @@ def build_default_paths() -> tuple[str, str]:
 
 
 def parse_args() -> argparse.Namespace:
-    default_excel, default_word = build_default_paths()
-
     parser = argparse.ArgumentParser(
         description=(
-            "Update a Word .docx file by replacing a target name with a value "
-            "taken from an Excel row (sheet 2, column 2 by default)."
+            "Update the default Word text location using a value from the "
+            "default Excel source. Only row number is required."
         )
     )
     parser.add_argument(
         "--rowNumber",
         type=int,
         required=True,
-        help="Excel row number (2 => second row, e.g., B2 for colIndex=1).",
-    )
-    parser.add_argument(
-        "--excel",
-        type=str,
-        default=default_excel,
-        help=f"Path to Excel workbook (default: {default_excel})",
-    )
-    parser.add_argument(
-        "--word",
-        type=str,
-        default=default_word,
-        help=f"Path to Word .docx file (default: {default_word})",
-    )
-    parser.add_argument(
-        "--sheetIndex",
-        type=int,
-        default=1,
-        help="Zero-based sheet index (default: 1 => second sheet).",
-    )
-    parser.add_argument(
-        "--colIndex",
-        type=int,
-        default=1,
-        help="Zero-based column index (default: 1 => second column / B).",
-    )
-    parser.add_argument(
-        "--target",
-        type=str,
-        default="Когогину С.А.",
-        help=(
-            "Target string in the Word document to replace. "
-            "If omitted, use --startIndex and --length for position mode."
-        ),
-    )
-    parser.add_argument(
-        "--startIndex",
-        type=int,
-        default=None,
-        help=(
-            "Start position in the concatenated Word text (position mode). "
-            "Used only when --target is not provided."
-        ),
-    )
-    parser.add_argument(
-        "--length",
-        type=int,
-        default=None,
-        help=(
-            "Number of characters to replace from --startIndex (position mode). "
-            "Used only when --target is not provided."
-        ),
-    )
-    parser.add_argument(
-        "--engine",
-        type=str,
-        choices=["auto", "word-com", "xml"],
-        default="auto",
-        help=(
-            "Replacement engine for target mode: "
-            "auto (prefer Word COM), word-com (force COM), xml (force XML strategy). "
-            "Position mode always uses XML strategy."
-        ),
+        help="Excel row number (2 => value from B2 on the second sheet).",
     )
 
     return parser.parse_args()
@@ -529,55 +554,37 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    default_excel, default_word = build_default_paths()
 
-    replacement = read_excel_value(
-        excel_path=args.excel,
-        sheet_index=args.sheetIndex,
-        col_index=args.colIndex,
+    replacement_raw = read_excel_value(
+        excel_path=default_excel,
+        sheet_index=DEFAULT_SHEET_INDEX,
+        col_index=DEFAULT_COL_INDEX,
         row_number=args.rowNumber,
     )
+    replacement = format_replacement_name(replacement_raw)
 
-    word_dir, word_name = os.path.split(args.word)
+    word_dir, word_name = os.path.split(default_word)
     base, ext = os.path.splitext(word_name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_name = f"{base}.updated.row{args.rowNumber}.{timestamp}{ext}"
     output_path = os.path.join(word_dir, output_name)
 
-    if args.startIndex is not None or args.length is not None:
-        if args.startIndex is None or args.length is None:
-            raise ValueError("Position mode requires both --startIndex and --length.")
-        replace_span_in_docx(
-            docx_path=args.word,
-            start_index=args.startIndex,
-            length=args.length,
+    try:
+        replace_text_with_word_com(
+            docx_path=default_word,
+            output_path=output_path,
+            target=DEFAULT_TARGET_TEXT,
+            replacement=replacement,
+        )
+    except Exception:
+        # Fallback path if Word COM is unavailable.
+        replace_text_in_docx(
+            docx_path=default_word,
+            target=DEFAULT_TARGET_TEXT,
             replacement=replacement,
             output_path=output_path,
         )
-    else:
-        if args.engine in ("auto", "word-com"):
-            try:
-                replace_text_with_word_com(
-                    docx_path=args.word,
-                    output_path=output_path,
-                    target=args.target,
-                    replacement=replacement,
-                )
-            except Exception:
-                if args.engine == "word-com":
-                    raise
-                replace_text_in_docx(
-                    docx_path=args.word,
-                    target=args.target,
-                    replacement=replacement,
-                    output_path=output_path,
-                )
-        else:
-            replace_text_in_docx(
-                docx_path=args.word,
-                target=args.target,
-                replacement=replacement,
-                output_path=output_path,
-            )
 
     print("Excel value:", replacement)
     print("Updated Word file written to:", output_path)
