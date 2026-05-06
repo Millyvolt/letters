@@ -26,6 +26,7 @@ DEFAULT_COMPANY_TARGET_TEXT = "ПАО «Камаз»"
 DEFAULT_ROLE_TARGET_TEXT = "Генеральному директору"
 DEFAULT_SALUTATION_ANCHOR = "Уважаемый "
 DEFAULT_TARGET_CASE = "datv"  # дательный падеж (пример: Ширманов -> Ширманову)
+EMAIL_REGEX = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 MORPH = pymorphy3.MorphAnalyzer()
 
 
@@ -133,6 +134,23 @@ def read_excel_value(
         )
 
     return str(value)
+
+
+def load_sheet_dataframe(excel_path: str, sheet_index: int) -> pd.DataFrame:
+    """
+    Load a sheet by zero-based index from Excel.
+    """
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f"Excel file not found: {excel_path}")
+
+    xls = pd.ExcelFile(excel_path)
+    if sheet_index < 0 or sheet_index >= len(xls.sheet_names):
+        raise IndexError(
+            f"sheet_index {sheet_index} out of range for workbook "
+            f"(sheets: {xls.sheet_names})"
+        )
+    sheet_name = xls.sheet_names[sheet_index]
+    return pd.read_excel(excel_path, sheet_name=sheet_name)
 
 
 def format_replacement_name(raw_value: str) -> str:
@@ -818,6 +836,81 @@ def build_default_paths() -> tuple[str, str]:
     return excel_path, word_path
 
 
+def build_replacements_for_row(df: pd.DataFrame, row_idx: int) -> list:
+    """
+    Build all replacement values for one dataframe row.
+    """
+    replacement_raw = str(df.iat[row_idx, DEFAULT_NAME_COL_INDEX])
+    replacement = format_replacement_name(replacement_raw)
+    company_replacement = str(df.iat[row_idx, DEFAULT_COMPANY_COL_INDEX])
+    role_raw = str(df.iat[row_idx, DEFAULT_ROLE_COL_INDEX])
+    role_replacement = format_role_to_dative(role_raw)
+    salutation_name = format_salutation_name(replacement_raw)
+    salutation_replacement = f"Уважаемый {salutation_name}!"
+
+    return [
+        (DEFAULT_TARGET_TEXT, replacement),
+        (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
+        (DEFAULT_ROLE_TARGET_TEXT, role_replacement),
+        {
+            "mode": "salutation_place",
+            "replacement": salutation_replacement,
+        },
+    ]
+
+
+def validate_row_for_batch(df: pd.DataFrame, row_idx: int) -> list[str]:
+    """
+    Validate row for batch processing.
+    Rules:
+    1) Column 2 must contain exactly 3 words.
+    2) Last column must contain an email.
+    """
+    reasons = []
+    name_value = str(df.iat[row_idx, DEFAULT_NAME_COL_INDEX]).strip()
+    name_words = [w for w in name_value.split() if w]
+    if len(name_words) != 3:
+        reasons.append("Column 2 must contain exactly 3 words")
+
+    last_col_idx = df.shape[1] - 1
+    email_value = str(df.iat[row_idx, last_col_idx]).strip()
+    if not EMAIL_REGEX.search(email_value):
+        reasons.append("Last column must contain a valid email")
+
+    return reasons
+
+
+def build_output_folder(base_dir: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder = os.path.join(base_dir, f"output_{timestamp}")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def process_single_row(
+    df: pd.DataFrame,
+    row_idx: int,
+    default_word: str,
+    output_folder: str,
+) -> str:
+    """
+    Process one row and write one output Word file.
+    """
+    _, word_name = os.path.split(default_word)
+    base, ext = os.path.splitext(word_name)
+    excel_row_number = row_idx + 2
+    output_name = f"{base}.updated.row{excel_row_number}{ext}"
+    output_path = os.path.join(output_folder, output_name)
+
+    replacements = build_replacements_for_row(df, row_idx)
+    replace_texts_with_word_com(
+        docx_path=default_word,
+        output_path=output_path,
+        replacements=replacements,
+    )
+    return output_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -825,11 +918,16 @@ def parse_args() -> argparse.Namespace:
             "default Excel source. Only row number is required."
         )
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
         "--rowNumber",
         type=int,
-        required=True,
         help="Excel row number (2 => value from B2 on the second sheet).",
+    )
+    mode_group.add_argument(
+        "--allRows",
+        action="store_true",
+        help="Process all data rows with validation rules.",
     )
 
     return parser.parse_args()
@@ -838,55 +936,57 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     default_excel, default_word = build_default_paths()
+    word_dir, _ = os.path.split(default_word)
+    output_folder = build_output_folder(word_dir)
+    df = load_sheet_dataframe(default_excel, DEFAULT_SHEET_INDEX)
 
-    replacement_raw = read_excel_value(
-        excel_path=default_excel,
-        sheet_index=DEFAULT_SHEET_INDEX,
-        col_index=DEFAULT_NAME_COL_INDEX,
-        row_number=args.rowNumber,
-    )
-    replacement = format_replacement_name(replacement_raw)
-    company_replacement = read_excel_value(
-        excel_path=default_excel,
-        sheet_index=DEFAULT_SHEET_INDEX,
-        col_index=DEFAULT_COMPANY_COL_INDEX,
-        row_number=args.rowNumber,
-    )
-    role_raw = read_excel_value(
-        excel_path=default_excel,
-        sheet_index=DEFAULT_SHEET_INDEX,
-        col_index=DEFAULT_ROLE_COL_INDEX,
-        row_number=args.rowNumber,
-    )
-    role_replacement = format_role_to_dative(role_raw)
-    salutation_name = format_salutation_name(replacement_raw)
-    salutation_replacement = f"Уважаемый {salutation_name}!"
+    if args.allRows:
+        processed_files = []
+        skipped_rows = []
+        for row_idx in range(len(df)):
+            reasons = validate_row_for_batch(df, row_idx)
+            if reasons:
+                row_data = df.iloc[row_idx].to_dict()
+                row_data["ExcelRow"] = row_idx + 2
+                row_data["Reason"] = "; ".join(reasons)
+                skipped_rows.append(row_data)
+                continue
 
-    word_dir, word_name = os.path.split(default_word)
-    base, ext = os.path.splitext(word_name)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_name = f"{base}.updated.row{args.rowNumber}.{timestamp}{ext}"
-    output_path = os.path.join(word_dir, output_name)
+            out_file = process_single_row(
+                df=df,
+                row_idx=row_idx,
+                default_word=default_word,
+                output_folder=output_folder,
+            )
+            processed_files.append(out_file)
 
-    replace_texts_with_word_com(
-        docx_path=default_word,
-        output_path=output_path,
-        replacements=[
-            (DEFAULT_TARGET_TEXT, replacement),
-            (DEFAULT_COMPANY_TARGET_TEXT, company_replacement),
-            (DEFAULT_ROLE_TARGET_TEXT, role_replacement),
-            {
-                "mode": "salutation_place",
-                "replacement": salutation_replacement,
-            },
-        ],
+        skipped_report_path = os.path.join(output_folder, "skipped_rows.xlsx")
+        skipped_df = pd.DataFrame(skipped_rows)
+        skipped_df.to_excel(skipped_report_path, index=False)
+
+        print("Engine used: word-com")
+        print("Mode: allRows")
+        print("Output folder:", output_folder)
+        print("Processed files:", len(processed_files))
+        print("Skipped rows:", len(skipped_rows))
+        print("Skipped report:", skipped_report_path)
+        return
+
+    # Single-row mode
+    row_idx = args.rowNumber - 2
+    if row_idx < 0 or row_idx >= len(df):
+        raise IndexError(
+            f"rowNumber {args.rowNumber} is out of range for available data rows"
+        )
+    output_path = process_single_row(
+        df=df,
+        row_idx=row_idx,
+        default_word=default_word,
+        output_folder=output_folder,
     )
-
-    print("Excel value:", replacement)
-    print("Company value:", company_replacement)
-    print("Role value:", role_replacement)
-    print("Salutation value:", salutation_replacement)
     print("Engine used: word-com")
+    print("Mode: rowNumber")
+    print("Output folder:", output_folder)
     print("Updated Word file written to:", output_path)
 
 
